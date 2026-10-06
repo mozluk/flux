@@ -2,11 +2,16 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
-import { exec } from "child_process";
+import { spawn } from "child_process";
 import { createGrpcClient } from "better-grpc";
 import { FluxService } from "./service";
+import { randomUUID } from "crypto";
 
 const GRPC_SERVER_ADDRESS = process.env.FLUX_SERVER_ADDRESS || "fluxy.photon.codes:443";
+// Validate that the server address uses a secure scheme
+if (!GRPC_SERVER_ADDRESS.startsWith("https://") && !GRPC_SERVER_ADDRESS.startsWith("grpcs://") && !GRPC_SERVER_ADDRESS.includes(":443")) {
+  console.warn("[FLUX] Warning: GRPC_SERVER_ADDRESS does not appear to use TLS. Consider using a secure endpoint.");
+}
 const CONFIG_DIR = path.join(process.env.HOME || "~", ".flux");
 const CONFIG_FILE = path.join(CONFIG_DIR, "credentials.json");
 const VERIFICATION_NUMBER = "+16286298650"; // Flux iMessage number for verification
@@ -22,15 +27,21 @@ export function loadCredentials(): FluxCredentials {
     if (fs.existsSync(CONFIG_FILE)) {
       return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
     }
-  } catch {}
+  } catch {
+    // Ignore parse errors (malformed/tampered file)
+  }
   return {};
 }
 
 function saveCredentials(credentials: FluxCredentials): void {
   if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   }
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(credentials, null, 2));
+  // Write with restrictive permissions (owner read/write only)
+  // Use a temporary file + rename for atomic write
+  const tempFile = CONFIG_FILE + ".tmp";
+  fs.writeFileSync(tempFile, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+  fs.renameSync(tempFile, CONFIG_FILE);
 }
 
 function clearCredentials(): void {
@@ -55,17 +66,26 @@ async function prompt(question: string): Promise<string> {
 function openIMessage(to: string, body: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const url = `sms:${to}&body=${encodeURIComponent(body)}`;
-    const command = process.platform === "darwin"
-      ? `open "${url}"`
-      : process.platform === "win32"
-      ? `start "" "${url}"`
-      : `xdg-open "${url}"`;
-
-    exec(command, (error) => {
-      if (error) {
-        reject(error);
-      } else {
+    // Use spawn with array arguments to avoid shell injection
+    let cmd: string;
+    let args: string[];
+    if (process.platform === "darwin") {
+      cmd = "open";
+      args = [url];
+    } else if (process.platform === "win32") {
+      cmd = "cmd.exe";
+      args = ["/c", "start", "", url];
+    } else {
+      cmd = "xdg-open";
+      args = [url];
+    }
+    const child = spawn(cmd, args, { stdio: "ignore" });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
         resolve();
+      } else {
+        reject(new Error(`${cmd} exited with code ${code}`));
       }
     });
   });
@@ -111,7 +131,7 @@ export async function login(): Promise<string> {
 
   try {
     const client = await createGrpcClientWithRetry();
-    const clientId = crypto.randomUUID();
+    const clientId = randomUUID();
 
     // Step 1: Request a dynamic verification code
     const codeResult = await client.FluxService.getDynamicCode(clientId, normalizedPhone);
