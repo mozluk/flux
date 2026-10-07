@@ -22,6 +22,11 @@ interface FluxCredentials {
   authenticatedAt?: string;
 }
 
+/**
+ * Loads stored Flux credentials from the local configuration file.
+ *
+ * @returns Parsed FluxCredentials if the file exists and is valid, or an empty object.
+ */
 export function loadCredentials(): FluxCredentials {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
@@ -33,23 +38,51 @@ export function loadCredentials(): FluxCredentials {
   return {};
 }
 
+/**
+ * Persists Flux credentials to disk atomically with restrictive file permissions.
+ *
+ * Uses a unique temporary file per invocation to prevent race conditions and
+ * cleans up staging artifacts if writing or renaming fails.
+ *
+ * @param credentials - The credentials object to store.
+ */
 function saveCredentials(credentials: FluxCredentials): void {
   if (!fs.existsSync(CONFIG_DIR)) {
     fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   }
   // Write with restrictive permissions (owner read/write only)
-  // Use a temporary file + rename for atomic write
-  const tempFile = CONFIG_FILE + ".tmp";
-  fs.writeFileSync(tempFile, JSON.stringify(credentials, null, 2), { mode: 0o600 });
-  fs.renameSync(tempFile, CONFIG_FILE);
+  // Use a unique temporary file + rename for atomic write
+  const tempFile = path.join(CONFIG_DIR, `.credentials-${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+    fs.renameSync(tempFile, CONFIG_FILE);
+  } catch (error) {
+    if (fs.existsSync(tempFile)) {
+      try {
+        fs.unlinkSync(tempFile);
+      } catch {
+        // Ignore secondary error during cleanup
+      }
+    }
+    throw error;
+  }
 }
 
+/**
+ * Removes the local credentials file if it exists.
+ */
 function clearCredentials(): void {
   if (fs.existsSync(CONFIG_FILE)) {
     fs.unlinkSync(CONFIG_FILE);
   }
 }
 
+/**
+ * Prompts the user for interactive CLI input.
+ *
+ * @param question - The prompt string to display to the user.
+ * @returns A promise resolving to the user's trimmed input.
+ */
 async function prompt(question: string): Promise<string> {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -63,6 +96,16 @@ async function prompt(question: string): Promise<string> {
   });
 }
 
+/**
+ * Opens the native iMessage or SMS client with a pre-filled recipient and message body.
+ *
+ * On Windows, invokes rundll32.exe url.dll,FileProtocolHandler to avoid cmd.exe
+ * command separator parsing breaking ampersand query parameters.
+ *
+ * @param to - Recipient phone number.
+ * @param body - Verification message body.
+ * @returns A promise that resolves when the external launcher command exits successfully.
+ */
 function openIMessage(to: string, body: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const url = `sms:${to}&body=${encodeURIComponent(body)}`;
@@ -73,8 +116,8 @@ function openIMessage(to: string, body: string): Promise<void> {
       cmd = "open";
       args = [url];
     } else if (process.platform === "win32") {
-      cmd = "cmd.exe";
-      args = ["/c", "start", "", url];
+      cmd = "rundll32.exe";
+      args = ["url.dll,FileProtocolHandler", url];
     } else {
       cmd = "xdg-open";
       args = [url];
@@ -91,6 +134,11 @@ function openIMessage(to: string, body: string): Promise<void> {
   });
 }
 
+/**
+ * Creates a gRPC client instance configured for the Flux service.
+ *
+ * @returns A promise resolving to the connected gRPC client.
+ */
 async function createGrpcClientWithRetry() {
   const clientImpl = FluxService.Client({
     async onIncomingMessage() {
@@ -100,6 +148,11 @@ async function createGrpcClientWithRetry() {
   return await createGrpcClient(GRPC_SERVER_ADDRESS, clientImpl);
 }
 
+/**
+ * Performs interactive login via iMessage verification and saves the resulting session token.
+ *
+ * @returns A promise resolving to the authenticated phone number.
+ */
 export async function login(): Promise<string> {
   // Check if already logged in with valid token
   const existing = loadCredentials();
@@ -182,6 +235,9 @@ export async function login(): Promise<string> {
   }
 }
 
+/**
+ * Revokes the active session token on the server and removes local credentials.
+ */
 export async function logout(): Promise<void> {
   const credentials = loadCredentials();
 
@@ -198,6 +254,11 @@ export async function logout(): Promise<void> {
   console.log("[FLUX] Logged out.");
 }
 
+/**
+ * Retrieves a valid auth token and phone number, prompting for login if expired or missing.
+ *
+ * @returns A promise resolving to the valid token and phone number.
+ */
 export async function getAuthToken(): Promise<{ token: string; phone: string }> {
   const credentials = loadCredentials();
 
@@ -231,13 +292,23 @@ export async function getAuthToken(): Promise<{ token: string; phone: string }> 
   return { token: newCredentials.token, phone };
 }
 
-// Legacy function for backwards compatibility
+/**
+ * Retrieves the authenticated user's phone number.
+ *
+ * @deprecated Use getAuthToken instead.
+ * @returns A promise resolving to the phone number.
+ */
 export async function getPhoneNumber(): Promise<string> {
   const { phone } = await getAuthToken();
   return phone;
 }
 
-// Legacy function for backwards compatibility
+/**
+ * Loads the stored phone number from local configuration.
+ *
+ * @deprecated Use loadCredentials instead.
+ * @returns An object containing the optional stored phone number.
+ */
 export function loadConfig(): { phoneNumber?: string } {
   const credentials = loadCredentials();
   return { phoneNumber: credentials.phone };
